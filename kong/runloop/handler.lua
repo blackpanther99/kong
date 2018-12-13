@@ -17,7 +17,6 @@ local balancer    = require "kong.runloop.balancer"
 local mesh        = require "kong.runloop.mesh"
 local constants   = require "kong.constants"
 local semaphore   = require "ngx.semaphore"
-local responses   = require "kong.tools.responses"
 local singletons  = require "kong.singletons"
 local certificate = require "kong.runloop.certificate"
 
@@ -52,6 +51,35 @@ local server_header = meta._SERVER_TOKENS
 
 local build_router_semaphore
 local build_api_router_semaphore
+
+
+local send_error_response
+do
+  local overrides = {
+    [405] = "Method not allowed",
+    [500] = "An unexpected error occurred",
+    [502] = "Bad gateway",
+  }
+
+  local defaults = {
+    [401] = "Unauthorized",
+    [404] = "Not found",
+    [503] = "Service unavailable",
+  }
+
+  send_error_response = function(status, err)
+    if err ~= nil and status == 500 or status == 502 then
+      kong.log.err(err)
+    end
+
+    local content = overrides[status] or err or defaults[status]
+    if content ~= nil and type(content) ~= "table" then
+      content = { message = content }
+    end
+
+    return kong.response.exit(status, content)
+  end
+end
 
 
 local function get_now()
@@ -693,7 +721,7 @@ return {
     after = function(ctx)
       local ok, err, errcode = balancer_setup_stage2(ctx)
       if not ok then
-        return responses.send(errcode, err)
+        return send_error_response(errcode, err)
       end
 
       local now = get_now()
@@ -738,9 +766,8 @@ return {
 
         local ok, err = build_api_router_semaphore:wait(timeout)
         if not ok then
-          return responses.send_HTTP_INTERNAL_SERVER_ERROR(
-            "error attempting to acquire build_api_router lock: " .. err
-          )
+          kong.log.err("error attempting to acquire build_api_router lock: " .. err)
+          return kong.response.exit(500, { message  = "An unexpected error occurred" })
         end
 
         -- lock acquired but we might not need to rebuild the api_router (if we
@@ -766,16 +793,17 @@ return {
       end
 
       if not api_router then
-        return responses.send_HTTP_INTERNAL_SERVER_ERROR("no API router to " ..
-                  "route request (reason: " .. tostring(api_router_err) .. ")")
+        kong.log.err("no API router to route request (reason: " ..
+                     tostring(api_router_err) .. ")")
+        return kong.response.exit(500, { message  = "An unexpected error occurred" })
       end
 
       -- router for Routes/Services
 
       local router, err = get_router()
       if not router then
-        return responses.send_HTTP_INTERNAL_SERVER_ERROR(
-          "no router to route request (reason: " .. err ..  ")")
+        kong.log.err("no router to route request (reason: " .. tostring(err) ..  ")")
+        return kong.response.exit(500, { message  = "An unexpected error occurred" })
       end
 
       -- routing request
@@ -788,7 +816,7 @@ return {
       if not match_t then
         match_t = api_router.exec(ngx)
         if not match_t then
-          return responses.send_HTTP_NOT_FOUND("no route and no API found with those values")
+          return kong.response.exit(404, { message = "no route and no API found with those values" })
         end
       end
 
@@ -831,7 +859,7 @@ return {
       then
         ngx.header["connection"] = "Upgrade"
         ngx.header["upgrade"]    = "TLS/1.2, HTTP/1.1"
-        return responses.send(426, "Please use HTTPS protocol")
+        return kong.response.exit(426, { message = "Please use HTTPS protocol" })
       end
 
       balancer_setup_stage1(ctx, match_t.upstream_scheme,
@@ -894,7 +922,7 @@ return {
 
       local ok, err, errcode = balancer_setup_stage2(ctx)
       if not ok then
-        return responses.send(errcode, err)
+        return send_error_response(errcode, err)
       end
 
       var.upstream_scheme = balancer_data.scheme
