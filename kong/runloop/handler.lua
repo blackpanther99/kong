@@ -53,35 +53,6 @@ local build_router_semaphore
 local build_api_router_semaphore
 
 
-local send_error_response
-do
-  local overrides = {
-    [405] = "Method not allowed",
-    [500] = "An unexpected error occurred",
-    [502] = "Bad gateway",
-  }
-
-  local defaults = {
-    [401] = "Unauthorized",
-    [404] = "Not found",
-    [503] = "Service unavailable",
-  }
-
-  send_error_response = function(status, err)
-    if err ~= nil and status == 500 or status == 502 then
-      kong.log.err(err)
-    end
-
-    local content = overrides[status] or err or defaults[status]
-    if content ~= nil and type(content) ~= "table" then
-      content = { message = content }
-    end
-
-    return kong.response.exit(status, content)
-  end
-end
-
-
 local function get_now()
   update_time()
   return ngx_now() * 1000 -- time is kept in seconds with millisecond resolution.
@@ -721,7 +692,8 @@ return {
     after = function(ctx)
       local ok, err, errcode = balancer_setup_stage2(ctx)
       if not ok then
-        return send_error_response(errcode, err)
+        local body = kong.response.get_default_exit_body(errcode, err)
+        return kong.response.exit(errcode, body)
       end
 
       local now = get_now()
@@ -922,7 +894,8 @@ return {
 
       local ok, err, errcode = balancer_setup_stage2(ctx)
       if not ok then
-        return send_error_response(errcode, err)
+        local body = kong.response.get_default_exit_body(errcode, err)
+        return kong.response.exit(errcode, body)
       end
 
       var.upstream_scheme = balancer_data.scheme
